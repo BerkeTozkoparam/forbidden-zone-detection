@@ -654,8 +654,12 @@ class ViolationLogger:
         os.makedirs(frames_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_file = os.path.join(CONFIG["log_dir"], f"violations_{ts}.txt")
+        self.csv_file = os.path.join(CONFIG["log_dir"], f"violations_{ts}.csv")
         self.total    = 0
         self._cd: dict = {}   # cooldown
+        # CSV başlık satırı
+        with open(self.csv_file, "w", encoding="utf-8") as f:
+            f.write("ihlal_no,tarih,saat,nesne_tipi,track_id,guven\n")
 
     def log(self, frame, track_id, cls_name, conf):
         now = time.time()
@@ -664,14 +668,19 @@ class ViolationLogger:
             return False
         self._cd[key] = now
         self.total += 1
-        ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        dt   = datetime.now()
+        ts   = dt.strftime("%Y-%m-%d %H:%M:%S")
         line = (f"[{ts}] IHLAL #{self.total} | {cls_name} "
                 f"| ID:{track_id} | Guven:{conf:.2f}\n")
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(line)
+        # CSV satırı
+        with open(self.csv_file, "a", encoding="utf-8") as f:
+            f.write(f"{self.total},{dt.strftime('%Y-%m-%d')},{dt.strftime('%H:%M:%S')},"
+                    f"{cls_name},{track_id},{conf:.2f}\n")
         if CONFIG["save_frames"]:
             fname = os.path.join(CONFIG["log_dir"], "frames",
-                                 f"v{self.total:04d}_{datetime.now().strftime('%H%M%S')}.jpg")
+                                 f"v{self.total:04d}_{dt.strftime('%H%M%S')}.jpg")
             cv2.imwrite(fname, frame)
         print(f"  >> {line.strip()}")
         return True
@@ -924,11 +933,16 @@ def run(source: str, zone_mode: str):
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, min(frame_w, 1280), min(frame_h, 720))
 
+    # macOS: mouse callback pencere ilk kez gösterilmeden çalışmıyor
+    _blank = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+    cv2.imshow(win, _blank)
+    cv2.waitKey(1)
+
     draw_mode = (zone_mode == "draw")
     if draw_mode:
         cv2.setMouseCallback(win, zone.mouse_callback)
         print("  [*] Mouse ile bolge cizin:")
-        print("      Sol tik=nokta | Sag tik=bitir\n")
+        print("      Sol tik=nokta | Enter/Space=bitir\n")
     else:
         zone.set_fixed_zone(frame_w, frame_h, sim_mode=is_sim)
 
@@ -1031,6 +1045,7 @@ def run(source: str, zone_mode: str):
     print(f"{'='*58}")
     print(f"  Toplam Ihlal : {logger.total}")
     print(f"  Log Dosyasi  : {logger.log_file}")
+    print(f"  CSV Raporu   : {logger.csv_file}")
     if CONFIG["save_frames"] and logger.total > 0:
         print(f"  Kaydedilen   : logs/frames/")
     if logger.total > 0:
