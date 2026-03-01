@@ -678,6 +678,77 @@ class ViolationLogger:
 
 
 # ─────────────────────────────────────────────
+#  VİDEO KLİP KAYDEDİCİ
+# ─────────────────────────────────────────────
+class VideoRecorder:
+    """
+    İhlal tespit edilince video klip kaydeder.
+    Son ihlalden `tail_secs` saniye sonra kaydı otomatik bitirir.
+    """
+
+    CODEC = "mp4v"
+
+    def __init__(self, log_dir: str, frame_w: int, frame_h: int,
+                 fps: int = 30, tail_secs: float = 6.0):
+        self.video_dir  = os.path.join(log_dir, "videos")
+        os.makedirs(self.video_dir, exist_ok=True)
+        self.fw         = frame_w
+        self.fh         = frame_h
+        self.fps        = fps
+        self.tail       = tail_secs
+        self._writer    = None
+        self._active    = False
+        self._last_vt   = 0.0
+        self._clip_n    = 0
+        self._cur_file  = ""
+
+    @property
+    def is_recording(self) -> bool:
+        return self._active
+
+    def notify_violation(self):
+        """Her ihlal tespitinde çağrılır."""
+        self._last_vt = time.time()
+        if not self._active:
+            self._start()
+
+    def _start(self):
+        self._clip_n += 1
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._cur_file = os.path.join(
+            self.video_dir,
+            f"clip_{self._clip_n:04d}_{ts}.mp4"
+        )
+        fourcc = cv2.VideoWriter_fourcc(*self.CODEC)
+        self._writer = cv2.VideoWriter(
+            self._cur_file, fourcc, self.fps, (self.fw, self.fh)
+        )
+        self._active = True
+        print(f"  [REC] Kayit basladi  → {os.path.basename(self._cur_file)}")
+
+    def write(self, frame):
+        """Her frame sonunda çağrılır."""
+        if self._active and self._writer is not None:
+            self._writer.write(frame)
+
+    def tick(self):
+        """Her frame'de çağrılır; kuyruk süresi bittiyse kaydı durdurur."""
+        if self._active and time.time() - self._last_vt > self.tail:
+            self._stop()
+
+    def _stop(self):
+        if self._writer is not None:
+            self._writer.release()
+            self._writer = None
+        self._active = False
+        print(f"  [REC] Kayit tamamlandi → {os.path.basename(self._cur_file)}")
+
+    def close(self):
+        if self._active:
+            self._stop()
+
+
+# ─────────────────────────────────────────────
 #  ORTAK TESPİT İŞLEME
 # ─────────────────────────────────────────────
 def process_detections(frame, frame_copy, dets, zone, logger):
@@ -743,7 +814,8 @@ def _draw_box(frame, x1, y1, x2, y2, label, color, violated):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255,255,255), 2)
 
 
-def draw_hud(frame, fps, total, zone_ready, draw_mode, alert_active, is_sim):
+def draw_hud(frame, fps, total, zone_ready, draw_mode, alert_active, is_sim,
+             is_recording=False):
     H, W = frame.shape[:2]
 
     # Üst şerit
@@ -757,6 +829,12 @@ def draw_hud(frame, fps, total, zone_ready, draw_mode, alert_active, is_sim):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.58, tag_c, 2)
     cv2.putText(frame, f"{fps:.1f}fps", (W-165, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (145,145,145), 1)
+
+    # REC göstergesi — yanıp sönen kırmızı nokta
+    if is_recording and int(time.time() * 2) % 2 == 0:
+        cv2.circle(frame, (W-220, 28), 7, (0, 0, 255), -1)
+        cv2.putText(frame, "REC", (W-208, 33),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 255), 2)
 
     # Alt şerit
     cv2.rectangle(frame, (0,H-40), (W,H), (16,16,16), -1)
@@ -837,8 +915,10 @@ def run(source: str, zone_mode: str):
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"  [OK] Cozunurluk: {frame_w}x{frame_h}")
 
-    zone   = ZoneManager()
-    logger = ViolationLogger()
+    zone     = ZoneManager()
+    logger   = ViolationLogger()
+    recorder = VideoRecorder(CONFIG["log_dir"], frame_w, frame_h,
+                             fps=CONFIG["sim_fps"])
 
     win = "Yasak Bolge Ihlal Tespit"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -907,8 +987,11 @@ def run(source: str, zone_mode: str):
 
         if violated_frame:
             alert_active = True; alert_timer = time.time()
+            recorder.notify_violation()
         elif time.time() - alert_timer > 2.0:
             alert_active = False
+
+        recorder.tick()   # kuyruk süresi bittiyse kaydı durdurur
 
         fps_cnt += 1
         if fps_cnt >= 15:
@@ -916,9 +999,11 @@ def run(source: str, zone_mode: str):
             fps_cnt = 0; fps_start = time.time()
 
         frame = draw_hud(frame, cur_fps, logger.total, zone.zone_ready,
-                         draw_mode, alert_active, is_sim)
+                         draw_mode, alert_active, is_sim,
+                         is_recording=recorder.is_recording)
         frame = draw_instructions(frame, zone.zone_ready, draw_mode, is_sim)
 
+        recorder.write(frame)   # HUD dahil tam kareyi kaydet
         cv2.imshow(win, frame)
 
         key = cv2.waitKey(wait_ms) & 0xFF
@@ -935,6 +1020,7 @@ def run(source: str, zone_mode: str):
             sim._spawn()
             print(f"  [+] Yeni nesne. Toplam: {len(sim.entities)}")
 
+    recorder.close()
     if not is_sim:
         assert cap is not None
         cap.release()
@@ -947,6 +1033,8 @@ def run(source: str, zone_mode: str):
     print(f"  Log Dosyasi  : {logger.log_file}")
     if CONFIG["save_frames"] and logger.total > 0:
         print(f"  Kaydedilen   : logs/frames/")
+    if logger.total > 0:
+        print(f"  Video Kayit  : logs/videos/")
     print(f"{'='*58}\n")
 
 
