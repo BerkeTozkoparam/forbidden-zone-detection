@@ -573,11 +573,15 @@ class ZoneManager:
             self.points.append((x, y))
             print(f"  [+] Nokta: ({x},{y})  —  Toplam: {len(self.points)}")
         elif event == cv2.EVENT_RBUTTONDOWN:
-            if len(self.points) >= 3:
-                self.zone_ready = True
-                print(f"  [OK] Bolge tamamlandi. {len(self.points)} nokta.")
-            else:
-                print("  [!] En az 3 nokta gerekli!")
+            self.finish()
+
+    def finish(self):
+        """Bölgeyi tamamla — sağ tık veya Enter ile çağrılır."""
+        if len(self.points) >= 3:
+            self.zone_ready = True
+            print(f"  [OK] Bolge tamamlandi. {len(self.points)} nokta.")
+        else:
+            print(f"  [!] En az 3 nokta gerekli! (Simdi: {len(self.points)})")
 
     def set_fixed_zone(self, fw, fh, sim_mode=False):
         if sim_mode:
@@ -624,9 +628,14 @@ class ZoneManager:
             cv2.putText(frame, "YASAK BOLGE", (cx2-tw//2, cy2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.68, (0, 200, 255), 2)
         else:
-            cv2.polylines(frame, [pts[:len(pts)-1] if len(pts)>1 else pts], False,
-                          CONFIG["zone_color"], 2)
-            cv2.line(frame, self.points[-1], self.temp_mouse, (120,120,120), 1)
+            # Tüm noktalar arası çizgiler
+            for i in range(len(self.points) - 1):
+                cv2.line(frame, self.points[i], self.points[i+1],
+                         CONFIG["zone_color"], 2, cv2.LINE_AA)
+            # Son noktadan mouse'a çizgi (temp_mouse (0,0) değilse)
+            if self.points and self.temp_mouse != (0, 0):
+                cv2.line(frame, self.points[-1], self.temp_mouse,
+                         (110, 110, 110), 1, cv2.LINE_AA)
 
         for pt in self.points:
             col = (80,190,255) if self.zone_ready else CONFIG["zone_color"]
@@ -776,8 +785,8 @@ def draw_instructions(frame, zone_ready, draw_mode, is_sim):
     if zone_ready:
         return frame
     H, W = frame.shape[:2]
-    lines = ["[ TALIMATLAR ]","","Sol tik : Nokta ekle","Sag tik : Bitir",
-             "  (min. 3 nokta)","","[R] Sifirla"]
+    lines = ["[ TALIMATLAR ]","","Sol tik : Nokta ekle",
+             "Sag tik / Enter : Bitir","  (min. 3 nokta)","","[R] Sifirla"]
     if is_sim:
         lines.append("[S] Nesne ekle")
     lines.append("[Q] Cikis")
@@ -915,6 +924,9 @@ def run(source: str, zone_mode: str):
         key = cv2.waitKey(wait_ms) & 0xFF
         if key in (ord('q'), 27):
             break
+        elif key in (13, ord(' ')) and not zone.zone_ready:
+            # Enter veya Space → bölgeyi tamamla (macOS sağ tık alternatifi)
+            zone.finish()
         elif key == ord('r'):
             zone.points = []; zone.zone_ready = False
             print("  [*] Bolge sifirlandi.")
