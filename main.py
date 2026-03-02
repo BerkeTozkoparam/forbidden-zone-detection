@@ -187,6 +187,54 @@ class IMUPlayer:
     def stop(self):
         self._running = False
 
+
+# ─────────────────────────────────────────────
+#  TEHDIT ISI HARITASI (HEATMAP)
+# ─────────────────────────────────────────────
+class HeatmapEngine:
+    """Tespit edilen nesnelerin konumlarını biriktirir, ısı haritası üretir."""
+
+    def __init__(self, w: int, h: int, sigma: int = 28, decay: float = 0.97):
+        self._w, self._h = w, h
+        self.map     = np.zeros((h, w), dtype=np.float32)
+        self.decay   = decay
+        self.enabled = True
+        ks = sigma * 4 + 1
+        if ks % 2 == 0:
+            ks += 1
+        k1d = cv2.getGaussianKernel(ks, sigma)
+        self._kernel = (k1d @ k1d.T).astype(np.float32)
+        self._ks   = ks
+        self._half = ks // 2
+
+    def add(self, cx: int, cy: int, weight: float = 1.0):
+        if not self.enabled:
+            return
+        half = self._half
+        x1k = max(0, half - cx);       y1k = max(0, half - cy)
+        x2k = min(self._ks, half + (self._w - cx))
+        y2k = min(self._ks, half + (self._h - cy))
+        x1f = max(0, cx - half);       y1f = max(0, cy - half)
+        x2f = min(self._w, cx + half + 1)
+        y2f = min(self._h, cy + half + 1)
+        if x1k >= x2k or y1k >= y2k:
+            return
+        self.map[y1f:y2f, x1f:x2f] += self._kernel[y1k:y2k, x1k:x2k] * weight * 80
+
+    def tick(self):
+        self.map *= self.decay
+        np.clip(self.map, 0, 255, out=self.map)
+
+    def apply(self, frame: np.ndarray, alpha: float = 0.45) -> np.ndarray:
+        if not self.enabled or self.map.max() < 0.5:
+            return frame
+        norm = np.clip(self.map / (self.map.max() + 1e-6) * 255, 0, 255).astype(np.uint8)
+        colored = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+        colored[norm < 18] = 0
+        mask = (norm.astype(np.float32) / 255.0 * alpha)[:, :, np.newaxis]
+        return np.clip(colored * mask + frame * (1.0 - mask), 0, 255).astype(np.uint8)
+
+
 # ─────────────────────────────────────────────
 #  SAHNE SABİTLERİ  (1280 × 720, sabit)
 # ─────────────────────────────────────────────
@@ -1006,6 +1054,127 @@ def _draw_sentinel_panel(frame, sentinel: dict):
     cv2.rectangle(frame, (x0+6, y0+91), (x0+6+int(bw*threat), y0+100), tc, -1)
 
 
+# ─────────────────────────────────────────────
+#  DASHBOARD PANELİ
+# ─────────────────────────────────────────────
+DASH_W = 280
+
+
+def _draw_line_graph(panel, values, x0, y0, gw, gh, color, label=""):
+    cv2.rectangle(panel, (x0, y0), (x0 + gw, y0 + gh), (18, 20, 18), -1)
+    if label:
+        cv2.putText(panel, label, (x0 + 3, y0 + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, (70, 70, 70), 1)
+    arr = list(values)
+    if len(arr) < 2:
+        return
+    for i in range(len(arr) - 1):
+        x1 = x0 + int(i / (len(arr) - 1) * gw)
+        x2 = x0 + int((i + 1) / (len(arr) - 1) * gw)
+        y1 = y0 + gh - int(max(0.0, min(1.0, arr[i])) * gh)
+        y2 = y0 + gh - int(max(0.0, min(1.0, arr[i + 1])) * gh)
+        cv2.line(panel, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
+
+
+def draw_dashboard(threat_hist, person_hist, anomaly_hist,
+                   sentinel, total_violations, session_start,
+                   clip_count, heatmap_on, panel_h=720):
+    pw = DASH_W
+    panel = np.full((panel_h, pw, 3), (12, 14, 12), dtype=np.uint8)
+    gw = pw - 18
+    y = 0
+
+    # ── Başlık ──────────────────────────────────
+    cv2.rectangle(panel, (0, y), (pw, y + 36), (8, 25, 8), -1)
+    cv2.putText(panel, "SENTINEL DASHBOARD", (7, y + 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 220, 80), 1)
+    y += 38
+
+    # ── Tehdit Seviyesi ─────────────────────────
+    threat  = list(threat_hist)[-1] if threat_hist else 0.0
+    tc, tlabel = _threat_style(threat)
+    cv2.putText(panel, "TEHDIT SEVIYESI", (7, y + 13),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (90, 90, 90), 1)
+    cv2.putText(panel, tlabel, (7, y + 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.72, tc, 2)
+    bw = int(gw * threat)
+    cv2.rectangle(panel, (7, y + 36), (7 + gw, y + 46), (28, 28, 28), -1)
+    cv2.rectangle(panel, (7, y + 36), (7 + bw, y + 46), tc, -1)
+    y += 52
+
+    # Tehdit geçmişi grafiği
+    _draw_line_graph(panel, threat_hist, 7, y, gw, 52, tc, "Tehdit Gecmisi")
+    y += 58
+
+    cv2.line(panel, (7, y), (pw - 7, y), (32, 32, 32), 1); y += 6
+
+    # ── IMU Füzyon ──────────────────────────────
+    cv2.putText(panel, "IMU FUZYON", (7, y + 13),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 160, 70), 1)
+    y += 18
+    if sentinel:
+        person  = sentinel.get("person", "?")
+        conf    = sentinel.get("conf", 0.0)
+        anomaly = sentinel.get("anomaly", 0.0)
+        ac, _   = _threat_style(anomaly)
+        cv2.putText(panel, f"Profil : {person.upper()}", (7, y + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (160, 255, 160), 1)
+        cv2.putText(panel, f"Guven  : %{conf * 100:.0f}", (7, y + 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (160, 255, 160), 1)
+        y += 34
+        _draw_line_graph(panel, anomaly_hist, 7, y, gw, 40, ac, "Anomali Gecmisi")
+        y += 46
+    else:
+        cv2.putText(panel, "Devre disi", (7, y + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (60, 60, 60), 1)
+        y += 20
+
+    cv2.line(panel, (7, y), (pw - 7, y), (32, 32, 32), 1); y += 6
+
+    # ── Kişi Sayısı ─────────────────────────────
+    person_count = int(round(list(person_hist)[-1] * 10)) if person_hist else 0
+    cv2.putText(panel, f"KISI SAYISI: {person_count}", (7, y + 13),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (90, 90, 90), 1)
+    y += 18
+    _draw_line_graph(panel, person_hist, 7, y, gw, 38, (80, 160, 255))
+    y += 44
+
+    cv2.line(panel, (7, y), (pw - 7, y), (32, 32, 32), 1); y += 6
+
+    # ── Oturum İstatistikleri ───────────────────
+    elapsed = int(time.time() - session_start)
+    h_e, rem = divmod(elapsed, 3600)
+    m_e, s_e = divmod(rem, 60)
+    cv2.putText(panel, "OTURUM", (7, y + 13),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (90, 90, 90), 1)
+    y += 18
+    for line_txt in [
+        f"Sure    : {h_e:02d}:{m_e:02d}:{s_e:02d}",
+        f"Ihlal   : {total_violations}",
+        f"Klip    : {clip_count}",
+    ]:
+        cv2.putText(panel, line_txt, (7, y + 13),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (140, 140, 140), 1)
+        y += 17
+
+    cv2.line(panel, (7, y), (pw - 7, y), (32, 32, 32), 1); y += 6
+
+    # ── Kontroller ──────────────────────────────
+    cv2.putText(panel, "KONTROLLER", (7, y + 13),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (70, 70, 70), 1)
+    y += 18
+    for k, v in [("[Q]", "Cikis"), ("[R]", "Bolge sifirla"),
+                 ("[H]", f"Harita {'ACIK' if heatmap_on else 'KAPALI'}"),
+                 ("[S]", "Nesne ekle (sim)")]:
+        cv2.putText(panel, f"{k} {v}", (7, y + 13),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.37, (80, 90, 80), 1)
+        y += 16
+
+    # Sol kenar çizgisi
+    cv2.line(panel, (0, 0), (0, panel_h), (0, 160, 60), 2)
+    return panel
+
+
 def draw_hud(frame, fps, total, zone_ready, draw_mode, alert_active, is_sim,
              is_recording=False, sentinel=None):
     H, W = frame.shape[:2]
@@ -1113,7 +1282,7 @@ def run(source: str, zone_mode: str):
 
     zone     = ZoneManager()
     logger   = ViolationLogger()
-    recorder = VideoRecorder(CONFIG["log_dir"], frame_w, frame_h,
+    recorder = VideoRecorder(CONFIG["log_dir"], frame_w + DASH_W, frame_h,
                              fps=CONFIG["sim_fps"])
 
     # ── Sentinel (IMU Füzyon) ──────────────────
@@ -1131,12 +1300,19 @@ def run(source: str, zone_mode: str):
         elif not os.path.exists(IMU_CSV):
             print(f"  [!] Sentinel devre disi ({IMU_CSV} bulunamadi)\n")
 
+    # ── Heatmap + Dashboard ────────────────────
+    heatmap      = HeatmapEngine(frame_w, frame_h)
+    threat_hist  = deque(maxlen=200)
+    person_hist  = deque(maxlen=200)
+    anomaly_hist = deque(maxlen=200)
+    session_start = time.time()
+
     win = "Yasak Bolge Ihlal Tespit"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, min(frame_w, 1280), min(frame_h, 720))
+    cv2.resizeWindow(win, min(frame_w + DASH_W, 1600), min(frame_h, 720))
 
     # macOS: mouse callback pencere ilk kez gösterilmeden çalışmıyor
-    _blank = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+    _blank = np.zeros((frame_h, frame_w + DASH_W, 3), dtype=np.uint8)
     cv2.imshow(win, _blank)
     cv2.waitKey(1)
 
@@ -1175,31 +1351,41 @@ def run(source: str, zone_mode: str):
         frame_copy = frame.copy()
         frame = zone.draw_zone(frame)
 
+        # ── Tespitler ─────────────────────────
+        all_dets: list = []
         violated_frame = False
-        if zone.zone_ready:
-            if is_sim:
-                assert sim is not None
-                dets = sim.get_detections()
-                violated_frame = process_detections(frame, frame_copy, dets, zone, logger)
-            else:
-                assert model is not None
-                results = model.track(
-                    frame, persist=True,
-                    conf=CONFIG["confidence"],
-                    classes=CONFIG["target_classes"],
-                    verbose=False,
-                )[0]
-                if results.boxes is not None:
-                    dets = []
-                    for box in results.boxes:
-                        x1,y1,x2,y2 = map(int, box.xyxy[0])
-                        cls_id   = int(box.cls[0])
-                        conf     = float(box.conf[0])
-                        track_id = int(box.id[0]) if box.id is not None else -1
-                        dets.append({"bbox":(x1,y1,x2,y2), "cls_id":cls_id,
-                                     "conf":conf, "track_id":track_id,
-                                     "cx":(x1+x2)//2, "cy":y2})
-                    violated_frame = process_detections(frame, frame_copy, dets, zone, logger)
+
+        if is_sim:
+            assert sim is not None
+            all_dets = sim.get_detections()
+            if zone.zone_ready:
+                violated_frame = process_detections(frame, frame_copy, all_dets, zone, logger)
+        else:
+            assert model is not None
+            results = model.track(
+                frame, persist=True,
+                conf=CONFIG["confidence"],
+                classes=CONFIG["target_classes"],
+                verbose=False,
+            )[0]
+            if results.boxes is not None:
+                for box in results.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    cls_id   = int(box.cls[0])
+                    det_conf = float(box.conf[0])
+                    track_id = int(box.id[0]) if box.id is not None else -1
+                    all_dets.append({"bbox": (x1,y1,x2,y2), "cls_id": cls_id,
+                                     "conf": det_conf, "track_id": track_id,
+                                     "cx": (x1+x2)//2, "cy": y2})
+                if zone.zone_ready:
+                    violated_frame = process_detections(frame, frame_copy, all_dets, zone, logger)
+
+        # ── Heatmap ───────────────────────────
+        for d in all_dets:
+            w_heat = 4.0 if zone.is_inside(d["cx"], d["cy"]) else 0.8
+            heatmap.add(d["cx"], d["cy"], w_heat)
+        heatmap.tick()
+        frame = heatmap.apply(frame)
 
         if violated_frame:
             alert_active = True; alert_timer = time.time()
@@ -1207,27 +1393,31 @@ def run(source: str, zone_mode: str):
         elif time.time() - alert_timer > 2.0:
             alert_active = False
 
-        recorder.tick()   # kuyruk süresi bittiyse kaydı durdurur
+        recorder.tick()
 
         # ── Sentinel füzyon ───────────────────
         sentinel_data = None
         if sentinel_model is not None and imu_player is not None:
             imu_win = imu_player.get()
             if imu_win is not None:
-                person, conf, anomaly = sentinel_model.predict(imu_win)
-                # Tehdit = anomali + düşük kimlik güveni + aktif ihlal
+                person, imu_conf, anomaly = sentinel_model.predict(imu_win)
                 threat = float(np.clip(
-                    anomaly * 0.5 + (1.0 - conf) * 0.3 + (0.2 if violated_frame else 0.0),
+                    anomaly * 0.5 + (1.0 - imu_conf) * 0.3 + (0.2 if violated_frame else 0.0),
                     0.0, 1.0
                 ))
                 sentinel_data = {
-                    "person": person, "conf": conf,
+                    "person": person, "conf": imu_conf,
                     "anomaly": anomaly, "threat": threat,
                 }
-                # Kritik tehdit → alarmı tetikle
                 if threat > 0.80 and not alert_active:
                     alert_active = True; alert_timer = time.time()
                     recorder.notify_violation()
+
+        # ── Geçmiş güncelle ───────────────────
+        cur_threat = sentinel_data["threat"] if sentinel_data else (0.3 if violated_frame else 0.0)
+        threat_hist.append(cur_threat)
+        person_hist.append(min(len(all_dets) / 10.0, 1.0))
+        anomaly_hist.append(sentinel_data["anomaly"] if sentinel_data else 0.0)
 
         fps_cnt += 1
         if fps_cnt >= 15:
@@ -1236,12 +1426,19 @@ def run(source: str, zone_mode: str):
 
         frame = draw_hud(frame, cur_fps, logger.total, zone.zone_ready,
                          draw_mode, alert_active, is_sim,
-                         is_recording=recorder.is_recording,
-                         sentinel=sentinel_data)
+                         is_recording=recorder.is_recording)
         frame = draw_instructions(frame, zone.zone_ready, draw_mode, is_sim)
 
-        recorder.write(frame)   # HUD dahil tam kareyi kaydet
-        cv2.imshow(win, frame)
+        # ── Dashboard ─────────────────────────
+        dashboard = draw_dashboard(
+            threat_hist, person_hist, anomaly_hist,
+            sentinel_data, logger.total, session_start,
+            recorder._clip_n, heatmap.enabled, panel_h=frame_h,
+        )
+        display = np.hstack([frame, dashboard])
+
+        recorder.write(display)
+        cv2.imshow(win, display)
 
         key = cv2.waitKey(wait_ms) & 0xFF
         if key in (ord('q'), 27):
@@ -1252,6 +1449,11 @@ def run(source: str, zone_mode: str):
         elif key == ord('r'):
             zone.points = []; zone.zone_ready = False
             print("  [*] Bolge sifirlandi.")
+        elif key == ord('h'):
+            heatmap.enabled = not heatmap.enabled
+            if not heatmap.enabled:
+                heatmap.map[:] = 0
+            print(f"  [*] Isi haritasi: {'ACIK' if heatmap.enabled else 'KAPALI'}")
         elif key == ord('s') and is_sim:
             assert sim is not None
             sim._spawn()
