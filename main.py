@@ -751,12 +751,15 @@ class SimulationEngine:
 #  BÖLGE YÖNETİCİSİ
 # ─────────────────────────────────────────────
 class ZoneManager:
-    def __init__(self):
-        self.points    = []
+    def __init__(self, max_x: int = 99999):
+        self.points     = []
         self.zone_ready = False
         self.temp_mouse = (0, 0)
+        self.max_x      = max_x   # dashboard alanına tıklamayı yok say
 
     def mouse_callback(self, event, x, y, flags, param):
+        if x >= self.max_x:        # dashboard alanı — yoksay
+            return
         self.temp_mouse = (x, y)
         if event == cv2.EVENT_LBUTTONDOWN:
             self.points.append((x, y))
@@ -1076,9 +1079,57 @@ def _draw_line_graph(panel, values, x0, y0, gw, gh, color, label=""):
         cv2.line(panel, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
 
 
+def _draw_minimap(panel, x0, y0, mw, mh,
+                  hmap_raw, zone_pts, fw, fh, entities, zone_ready):
+    """Taktik saha haritası: ısı haritası + bölge + varlık noktaları."""
+    sx, sy = mw / fw, mh / fh
+
+    # Arka plan — koyu yeşil grid
+    cv2.rectangle(panel, (x0, y0), (x0 + mw, y0 + mh), (10, 22, 10), -1)
+    for gx in range(0, mw, mw // 8):
+        cv2.line(panel, (x0 + gx, y0), (x0 + gx, y0 + mh), (18, 32, 18), 1)
+    for gy in range(0, mh, mh // 6):
+        cv2.line(panel, (x0, y0 + gy), (x0 + mw, y0 + gy), (18, 32, 18), 1)
+
+    # Isı haritası overlay
+    if hmap_raw is not None and hmap_raw.max() > 0.5:
+        norm = np.clip(hmap_raw / (hmap_raw.max() + 1e-6) * 255, 0, 255).astype(np.uint8)
+        norm_s = cv2.resize(norm, (mw, mh), interpolation=cv2.INTER_LINEAR)
+        colored = cv2.applyColorMap(norm_s, cv2.COLORMAP_JET)
+        colored[norm_s < 18] = 0
+        roi  = panel[y0:y0 + mh, x0:x0 + mw].astype(np.float32)
+        mask = (norm_s.astype(np.float32) / 255.0 * 0.75)[:, :, np.newaxis]
+        panel[y0:y0 + mh, x0:x0 + mw] = np.clip(
+            colored * mask + roi * (1.0 - mask), 0, 255).astype(np.uint8)
+
+    # Yasak bölge çerçevesi
+    if zone_pts and len(zone_pts) >= 3:
+        sp = np.array([(x0 + int(p[0] * sx), y0 + int(p[1] * sy))
+                       for p in zone_pts], dtype=np.int32)
+        color = (0, 200, 255) if zone_ready else (0, 120, 180)
+        cv2.polylines(panel, [sp], True, color, 1, cv2.LINE_AA)
+
+    # Varlık noktaları
+    for d in (entities or []):
+        ex = x0 + int(d["cx"] * sx)
+        ey = y0 + int(d["cy"] * sy)
+        in_z = zone_pts and len(zone_pts) >= 3 and \
+               cv2.pointPolygonTest(
+                   np.array(zone_pts, np.int32),
+                   (float(d["cx"]), float(d["cy"])), False) >= 0
+        cv2.circle(panel, (ex, ey), 2, (0, 0, 220) if in_z else (0, 220, 80), -1)
+
+    # Dış çerçeve ve etiket
+    cv2.rectangle(panel, (x0, y0), (x0 + mw, y0 + mh), (0, 120, 60), 1)
+    cv2.putText(panel, "TAKTIK SAHA HARITASI", (x0 + 3, y0 + mh - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.30, (0, 140, 70), 1)
+
+
 def draw_dashboard(threat_hist, person_hist, anomaly_hist,
                    sentinel, total_violations, session_start,
-                   clip_count, heatmap_on, panel_h=720):
+                   clip_count, heatmap_on, panel_h=720,
+                   hmap_raw=None, zone_pts=None, fw=1280, fh=720, entities=None,
+                   zone_ready=False):
     pw = DASH_W
     panel = np.full((panel_h, pw, 3), (12, 14, 12), dtype=np.uint8)
     gw = pw - 18
@@ -1103,8 +1154,20 @@ def draw_dashboard(threat_hist, person_hist, anomaly_hist,
     y += 52
 
     # Tehdit geçmişi grafiği
-    _draw_line_graph(panel, threat_hist, 7, y, gw, 52, tc, "Tehdit Gecmisi")
-    y += 58
+    _draw_line_graph(panel, threat_hist, 7, y, gw, 44, tc, "Tehdit Gecmisi")
+    y += 50
+
+    cv2.line(panel, (7, y), (pw - 7, y), (32, 32, 32), 1); y += 6
+
+    # ── TAKTİK SAHA HARİTASI ────────────────────
+    cv2.putText(panel, "SAHA HARITASI", (7, y + 13),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 140, 70), 1)
+    y += 16
+    mw = gw
+    mh = int(mw * fh / fw)          # orantılı yükseklik
+    _draw_minimap(panel, 7, y, mw, mh,
+                  hmap_raw, zone_pts, fw, fh, entities, zone_ready)
+    y += mh + 4
 
     cv2.line(panel, (7, y), (pw - 7, y), (32, 32, 32), 1); y += 6
 
@@ -1117,27 +1180,17 @@ def draw_dashboard(threat_hist, person_hist, anomaly_hist,
         conf    = sentinel.get("conf", 0.0)
         anomaly = sentinel.get("anomaly", 0.0)
         ac, _   = _threat_style(anomaly)
-        cv2.putText(panel, f"Profil : {person.upper()}", (7, y + 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (160, 255, 160), 1)
-        cv2.putText(panel, f"Guven  : %{conf * 100:.0f}", (7, y + 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (160, 255, 160), 1)
-        y += 34
-        _draw_line_graph(panel, anomaly_hist, 7, y, gw, 40, ac, "Anomali Gecmisi")
-        y += 46
+        cv2.putText(panel, f"Profil : {person.upper()}", (7, y + 13),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 255, 160), 1)
+        cv2.putText(panel, f"Guven  : %{conf * 100:.0f}", (7, y + 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 255, 160), 1)
+        y += 32
+        _draw_line_graph(panel, anomaly_hist, 7, y, gw, 34, ac, "Anomali")
+        y += 40
     else:
-        cv2.putText(panel, "Devre disi", (7, y + 14),
+        cv2.putText(panel, "Devre disi", (7, y + 13),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (60, 60, 60), 1)
-        y += 20
-
-    cv2.line(panel, (7, y), (pw - 7, y), (32, 32, 32), 1); y += 6
-
-    # ── Kişi Sayısı ─────────────────────────────
-    person_count = int(round(list(person_hist)[-1] * 10)) if person_hist else 0
-    cv2.putText(panel, f"KISI SAYISI: {person_count}", (7, y + 13),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (90, 90, 90), 1)
-    y += 18
-    _draw_line_graph(panel, person_hist, 7, y, gw, 38, (80, 160, 255))
-    y += 44
+        y += 18
 
     cv2.line(panel, (7, y), (pw - 7, y), (32, 32, 32), 1); y += 6
 
@@ -1145,6 +1198,7 @@ def draw_dashboard(threat_hist, person_hist, anomaly_hist,
     elapsed = int(time.time() - session_start)
     h_e, rem = divmod(elapsed, 3600)
     m_e, s_e = divmod(rem, 60)
+    person_count = int(round(list(person_hist)[-1] * 10)) if person_hist else 0
     cv2.putText(panel, "OTURUM", (7, y + 13),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.40, (90, 90, 90), 1)
     y += 18
@@ -1152,23 +1206,24 @@ def draw_dashboard(threat_hist, person_hist, anomaly_hist,
         f"Sure    : {h_e:02d}:{m_e:02d}:{s_e:02d}",
         f"Ihlal   : {total_violations}",
         f"Klip    : {clip_count}",
+        f"Kisi    : {person_count}",
     ]:
         cv2.putText(panel, line_txt, (7, y + 13),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (140, 140, 140), 1)
-        y += 17
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.39, (140, 140, 140), 1)
+        y += 16
 
     cv2.line(panel, (7, y), (pw - 7, y), (32, 32, 32), 1); y += 6
 
     # ── Kontroller ──────────────────────────────
     cv2.putText(panel, "KONTROLLER", (7, y + 13),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (70, 70, 70), 1)
-    y += 18
+    y += 16
     for k, v in [("[Q]", "Cikis"), ("[R]", "Bolge sifirla"),
-                 ("[H]", f"Harita {'ACIK' if heatmap_on else 'KAPALI'}"),
+                 ("[H]", f"Harita: {'ACIK' if heatmap_on else 'KAPALI'}"),
                  ("[S]", "Nesne ekle (sim)")]:
-        cv2.putText(panel, f"{k} {v}", (7, y + 13),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.37, (80, 90, 80), 1)
-        y += 16
+        cv2.putText(panel, f"{k} {v}", (7, y + 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (80, 90, 80), 1)
+        y += 15
 
     # Sol kenar çizgisi
     cv2.line(panel, (0, 0), (0, panel_h), (0, 160, 60), 2)
@@ -1280,7 +1335,7 @@ def run(source: str, zone_mode: str):
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"  [OK] Cozunurluk: {frame_w}x{frame_h}")
 
-    zone     = ZoneManager()
+    zone     = ZoneManager(max_x=frame_w)
     logger   = ViolationLogger()
     recorder = VideoRecorder(CONFIG["log_dir"], frame_w + DASH_W, frame_h,
                              fps=CONFIG["sim_fps"])
@@ -1434,6 +1489,9 @@ def run(source: str, zone_mode: str):
             threat_hist, person_hist, anomaly_hist,
             sentinel_data, logger.total, session_start,
             recorder._clip_n, heatmap.enabled, panel_h=frame_h,
+            hmap_raw=heatmap.map, zone_pts=zone.points,
+            fw=frame_w, fh=frame_h, entities=all_dets,
+            zone_ready=zone.zone_ready,
         )
         display = np.hstack([frame, dashboard])
 
