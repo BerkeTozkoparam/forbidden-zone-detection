@@ -23,8 +23,20 @@ import argparse
 import time
 import os
 import random
+import threading
+from collections import deque
 from datetime import datetime
 from ultralytics import YOLO
+
+try:
+    import pandas as pd
+    from sklearn.ensemble import RandomForestClassifier, IsolationForest
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import train_test_split
+    import joblib
+    SENTINEL_OK = True
+except ImportError:
+    SENTINEL_OK = False
 
 # ─────────────────────────────────────────────
 #  YAPILANDIRMA
@@ -36,7 +48,7 @@ CONFIG = {
     "alert_color":    (0, 0, 255),
     "safe_color":     (0, 255, 0),
     "zone_color":     (0, 200, 255),
-    "log_dir":        "logs",
+    "log_dir":        os.path.join(os.path.expanduser("~"), "Desktop", "ihlal_kayitlari"),
     "save_frames":    True,
     "sim_entities":   18,
     "sim_fps":        30,
@@ -45,6 +57,135 @@ CONFIG = {
 CLASS_NAMES_TR = {
     0: "KISI", 2: "OTOMOBIL", 3: "MOTORSIKLET", 5: "OTOBUS", 7: "KAMYON"
 }
+
+# ─────────────────────────────────────────────
+#  SENTINEL — IMU SENSOR FÜZYON
+# ─────────────────────────────────────────────
+IMU_CSV      = "data-2.csv"
+IMU_FEATURES = ["accelX","accelY","accelZ",
+                "linearAcX","linearAcY","linearAcZ",
+                "orientX","orientY","orientZ"]
+IMU_WINDOW   = 50    # pencere boyutu (örnek sayısı)
+IMU_STEP     = 10    # eğitim sırasında adım
+IMU_FPS      = 50    # CSV oynatma hızı (Hz)
+_MODEL_FILE  = "sentinel_model.pkl"
+
+# Tehdit renkleri (BGR) ve etiketleri
+_THREAT_LEVELS = [
+    (0.33, (0, 200,  80), "DUSUK"),
+    (0.60, (0, 200, 255), "ORTA"),
+    (0.80, (0, 100, 255), "YUKSEK"),
+    (1.01, (0,   0, 255), "KRITIK"),
+]
+
+def _threat_style(level: float):
+    for thr, color, label in _THREAT_LEVELS:
+        if level < thr:
+            return color, label
+    return (0, 0, 255), "KRITIK"
+
+
+def _extract_imu_features(window: np.ndarray) -> np.ndarray:
+    """50×9 pencereden istatistiksel özellik vektörü çıkar."""
+    feats = []
+    for col in range(window.shape[1]):
+        d = window[:, col]
+        feats += [d.mean(), d.std(), d.min(), d.max()]
+    # İvme ve lineer ivme büyüklükleri
+    mag  = np.linalg.norm(window[:, :3], axis=1)
+    lmag = np.linalg.norm(window[:, 3:6], axis=1)
+    feats += [mag.mean(),  mag.std(),  mag.max()]
+    feats += [lmag.mean(), lmag.std(), lmag.max()]
+    return np.array(feats, dtype=np.float32)
+
+
+class SentinelModel:
+    """Random Forest (kimlik) + Isolation Forest (anomali) füzyon modeli."""
+
+    def __init__(self, csv_path: str):
+        if os.path.exists(_MODEL_FILE):
+            print("  [*] Sentinel modeli yukleniyor...")
+            self.clf, self.iso, self.scaler = joblib.load(_MODEL_FILE)  # type: ignore[name-defined]
+            print("  [OK] Model yuklendi.")
+        else:
+            self.clf, self.iso, self.scaler = self._train(csv_path)
+            joblib.dump((self.clf, self.iso, self.scaler), _MODEL_FILE)  # type: ignore[name-defined]
+            print(f"  [OK] Model kaydedildi → {_MODEL_FILE}")
+
+    def _train(self, csv_path: str):
+        print("  [*] Dataset yukleniyor...")
+        df = pd.read_csv(csv_path, index_col=0)  # type: ignore[name-defined]
+        X_list, y_list = [], []
+        for person, grp in df.groupby("class"):
+            vals = grp[IMU_FEATURES].values
+            for i in range(0, len(vals) - IMU_WINDOW, IMU_STEP):
+                X_list.append(_extract_imu_features(vals[i:i + IMU_WINDOW]))
+                y_list.append(person)
+        X = np.array(X_list)
+        y = np.array(y_list)
+        print(f"  [OK] {len(X)} pencere olusturuldu.")
+
+        scaler = StandardScaler().fit(X)  # type: ignore[name-defined]
+        Xs = scaler.transform(X)
+
+        print("  [*] Siniflandirici egitiliyor...")
+        Xtr, Xte, ytr, yte = train_test_split(  # type: ignore[name-defined]
+            Xs, y, test_size=0.2, stratify=y, random_state=42)
+        clf = RandomForestClassifier(n_estimators=150, random_state=42, n_jobs=-1)  # type: ignore[name-defined]
+        clf.fit(Xtr, ytr)
+        print(f"  [OK] Dogruluk: %{clf.score(Xte, yte)*100:.1f}")
+
+        print("  [*] Anomali dedektoru egitiliyor...")
+        iso = IsolationForest(contamination=0.05, random_state=42, n_jobs=-1)  # type: ignore[name-defined]
+        iso.fit(Xs)
+        return clf, iso, scaler
+
+    def predict(self, window: np.ndarray):
+        """Dönüş: (kisi_adi, guven_0_1, anomali_0_1)"""
+        feat = _extract_imu_features(window).reshape(1, -1)
+        feat_sc = self.scaler.transform(feat)
+
+        probs  = self.clf.predict_proba(feat_sc)[0]
+        person = self.clf.classes_[probs.argmax()]
+        conf   = float(probs.max())
+
+        iso_sc  = float(self.iso.score_samples(feat_sc)[0])
+        # score_samples: daha negatif → daha anomali; [-0.3, 0.1] arası tipik
+        anomaly = float(np.clip((-iso_sc - 0.05) / 0.25, 0.0, 1.0))
+        return person, conf, anomaly
+
+
+class IMUPlayer:
+    """CSV'yi arka planda gerçek zamanlı sensor gibi oynatır."""
+
+    def __init__(self, csv_path: str):
+        df = pd.read_csv(csv_path, index_col=0)  # type: ignore[name-defined]
+        self._data    = df[IMU_FEATURES].values
+        self._idx     = 0
+        self._buf     = deque(maxlen=IMU_WINDOW)  # type: ignore[name-defined]
+        self._lock    = threading.Lock()
+        self._window  = None
+        self._running = True
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        interval = 1.0 / IMU_FPS
+        while self._running:
+            t0 = time.time()
+            with self._lock:
+                self._buf.append(self._data[self._idx])
+                self._idx = (self._idx + 1) % len(self._data)
+                if len(self._buf) == IMU_WINDOW:
+                    self._window = np.array(self._buf)
+            elapsed = time.time() - t0
+            time.sleep(max(0.0, interval - elapsed))
+
+    def get(self):
+        with self._lock:
+            return self._window
+
+    def stop(self):
+        self._running = False
 
 # ─────────────────────────────────────────────
 #  SAHNE SABİTLERİ  (1280 × 720, sabit)
@@ -678,7 +819,7 @@ class ViolationLogger:
         with open(self.csv_file, "a", encoding="utf-8") as f:
             f.write(f"{self.total},{dt.strftime('%Y-%m-%d')},{dt.strftime('%H:%M:%S')},"
                     f"{cls_name},{track_id},{conf:.2f}\n")
-        if CONFIG["save_frames"]:
+            
             fname = os.path.join(CONFIG["log_dir"], "frames",
                                  f"v{self.total:04d}_{dt.strftime('%H%M%S')}.jpg")
             cv2.imwrite(fname, frame)
@@ -823,8 +964,50 @@ def _draw_box(frame, x1, y1, x2, y2, label, color, violated):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255,255,255), 2)
 
 
+def _draw_sentinel_panel(frame, sentinel: dict):
+    """Sağ alt köşeye IMU füzyon paneli çizer."""
+    H, W = frame.shape[:2]
+    person  = sentinel.get("person", "?")
+    conf    = sentinel.get("conf", 0.0)
+    anomaly = sentinel.get("anomaly", 0.0)
+    threat  = sentinel.get("threat", 0.0)
+    tc, tlabel = _threat_style(threat)
+
+    pw, ph = 210, 110
+    x0, y0 = W - pw - 8, H - ph - 48   # alt şeridin üstünde
+
+    # Arka plan
+    ov = frame.copy()
+    cv2.rectangle(ov, (x0, y0), (x0+pw, y0+ph), (10, 12, 10), -1)
+    cv2.addWeighted(ov, 0.75, frame, 0.25, 0, frame)
+    cv2.rectangle(frame, (x0, y0), (x0+pw, y0+ph), tc, 1)
+
+    # Başlık
+    cv2.putText(frame, "IMU SENSOR FUZYON", (x0+6, y0+14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 200, 80), 1)
+
+    # Kişi profili
+    cv2.putText(frame, f"PROFIL : {person.upper()}", (x0+6, y0+30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 255, 180), 1)
+    cv2.putText(frame, f"GUVEN  : %{conf*100:.0f}", (x0+6, y0+45),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 255, 180), 1)
+
+    # Anomali bar
+    cv2.putText(frame, "ANOMALI", (x0+6, y0+60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (130, 130, 130), 1)
+    bw = pw - 12
+    cv2.rectangle(frame, (x0+6, y0+63), (x0+6+bw, y0+72), (35, 35, 35), -1)
+    cv2.rectangle(frame, (x0+6, y0+63), (x0+6+int(bw*anomaly), y0+72), tc, -1)
+
+    # Tehdit seviyesi
+    cv2.putText(frame, f"TEHDIT : {tlabel}", (x0+6, y0+88),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, tc, 1)
+    cv2.rectangle(frame, (x0+6, y0+91), (x0+6+bw, y0+100), (35, 35, 35), -1)
+    cv2.rectangle(frame, (x0+6, y0+91), (x0+6+int(bw*threat), y0+100), tc, -1)
+
+
 def draw_hud(frame, fps, total, zone_ready, draw_mode, alert_active, is_sim,
-             is_recording=False):
+             is_recording=False, sentinel=None):
     H, W = frame.shape[:2]
 
     # Üst şerit
@@ -857,6 +1040,10 @@ def draw_hud(frame, fps, total, zone_ready, draw_mode, alert_active, is_sim,
     mt = "MOUSE" if draw_mode else "SABIT"
     cv2.putText(frame, f"MOD:{mt}", (W-155, H-12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (130,130,130), 1)
+
+    # Sentinel paneli
+    if sentinel is not None:
+        _draw_sentinel_panel(frame, sentinel)
 
     # Alarm çerçevesi
     if alert_active and int(time.time()*3) % 2 == 0:
@@ -928,6 +1115,21 @@ def run(source: str, zone_mode: str):
     logger   = ViolationLogger()
     recorder = VideoRecorder(CONFIG["log_dir"], frame_w, frame_h,
                              fps=CONFIG["sim_fps"])
+
+    # ── Sentinel (IMU Füzyon) ──────────────────
+    sentinel_model = None
+    imu_player     = None
+    if SENTINEL_OK and os.path.exists(IMU_CSV):
+        print("  [*] Sentinel sistemi baslatiliyor...")
+        sentinel_model = SentinelModel(IMU_CSV)
+        imu_player     = IMUPlayer(IMU_CSV)
+        time.sleep(0.5)   # buffer dolsun
+        print("  [OK] IMU fuzyon aktif!\n")
+    else:
+        if not SENTINEL_OK:
+            print("  [!] Sentinel devre disi (pandas/sklearn eksik)\n")
+        elif not os.path.exists(IMU_CSV):
+            print(f"  [!] Sentinel devre disi ({IMU_CSV} bulunamadi)\n")
 
     win = "Yasak Bolge Ihlal Tespit"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -1007,6 +1209,26 @@ def run(source: str, zone_mode: str):
 
         recorder.tick()   # kuyruk süresi bittiyse kaydı durdurur
 
+        # ── Sentinel füzyon ───────────────────
+        sentinel_data = None
+        if sentinel_model is not None and imu_player is not None:
+            imu_win = imu_player.get()
+            if imu_win is not None:
+                person, conf, anomaly = sentinel_model.predict(imu_win)
+                # Tehdit = anomali + düşük kimlik güveni + aktif ihlal
+                threat = float(np.clip(
+                    anomaly * 0.5 + (1.0 - conf) * 0.3 + (0.2 if violated_frame else 0.0),
+                    0.0, 1.0
+                ))
+                sentinel_data = {
+                    "person": person, "conf": conf,
+                    "anomaly": anomaly, "threat": threat,
+                }
+                # Kritik tehdit → alarmı tetikle
+                if threat > 0.80 and not alert_active:
+                    alert_active = True; alert_timer = time.time()
+                    recorder.notify_violation()
+
         fps_cnt += 1
         if fps_cnt >= 15:
             cur_fps = fps_cnt / (time.time() - fps_start)
@@ -1014,7 +1236,8 @@ def run(source: str, zone_mode: str):
 
         frame = draw_hud(frame, cur_fps, logger.total, zone.zone_ready,
                          draw_mode, alert_active, is_sim,
-                         is_recording=recorder.is_recording)
+                         is_recording=recorder.is_recording,
+                         sentinel=sentinel_data)
         frame = draw_instructions(frame, zone.zone_ready, draw_mode, is_sim)
 
         recorder.write(frame)   # HUD dahil tam kareyi kaydet
@@ -1035,6 +1258,8 @@ def run(source: str, zone_mode: str):
             print(f"  [+] Yeni nesne. Toplam: {len(sim.entities)}")
 
     recorder.close()
+    if imu_player is not None:
+        imu_player.stop()
     if not is_sim:
         assert cap is not None
         cap.release()
@@ -1047,9 +1272,9 @@ def run(source: str, zone_mode: str):
     print(f"  Log Dosyasi  : {logger.log_file}")
     print(f"  CSV Raporu   : {logger.csv_file}")
     if CONFIG["save_frames"] and logger.total > 0:
-        print(f"  Kaydedilen   : logs/frames/")
+        print(f"  Kaydedilen   : {os.path.join(CONFIG['log_dir'], 'frames')}/")
     if logger.total > 0:
-        print(f"  Video Kayit  : logs/videos/")
+        print(f"  Video Kayit  : {os.path.join(CONFIG['log_dir'], 'videos')}/")
     print(f"{'='*58}\n")
 
 
